@@ -71,12 +71,60 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(
 # calendar_features, make_inputs and make_window: copied word for word from the final project notebooks. Change them there,
 # change them here.
 # ----------------------------------------------------------------------------------------------------------------
+# >>> shared with the notebook (FP2 Part 10.10): keep this block IDENTICAL in both places >>>
 WEATHER = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct"]
+CALENDAR = ["hour_sin", "hour_cos", "dow_sin", "dow_cos", "doy_sin", "doy_cos", "is_weekend", "is_holiday"]
 HOLIDAYS = USFederalHolidayCalendar().holidays(start="2020-01-01", end="2030-12-31")
+BRADLEY_LAT, BRADLEY_LON = 41.9389, -72.6832      # Bradley airport, where the weather is measured and forecast
+
+
+def semi_holidays(first_year=2020, last_year=2030):
+    """Days that are not federal holidays but behave like one: the day after Thanksgiving, Dec 24, Dec 26, Dec 31."""
+    days = []
+    for year in range(first_year, last_year + 1):
+        november_1 = pd.Timestamp(year, 11, 1)
+        thanksgiving = november_1 + pd.Timedelta(days=(3 - november_1.dayofweek) % 7 + 21)    # 4th Thursday
+        days += [thanksgiving + pd.Timedelta(days=1), pd.Timestamp(year, 12, 24), pd.Timestamp(year, 12, 26),
+                 pd.Timestamp(year, 12, 31)]
+    return pd.DatetimeIndex(days)
+
+
+SEMI_HOLIDAYS = semi_holidays()
+
+
+def sun_height(hours_utc):
+    """sin(solar elevation) at Bradley in the MIDDLE of each hour (NOAA's formulas, plain numpy):
+    1 = sun straight overhead, 0 = on the horizon, below 0 = night."""
+    t = pd.DatetimeIndex(hours_utc).tz_convert("UTC") + pd.Timedelta(minutes=30)
+    hour = t.hour.values + t.minute.values / 60
+    year_angle = 2 * np.pi / 365 * (t.dayofyear.values - 1 + (hour - 12) / 24)
+    declination = (0.006918 - 0.399912 * np.cos(year_angle) + 0.070257 * np.sin(year_angle)
+                   - 0.006758 * np.cos(2 * year_angle) + 0.000907 * np.sin(2 * year_angle)
+                   - 0.002697 * np.cos(3 * year_angle) + 0.00148 * np.sin(3 * year_angle))
+    equation_of_time = 229.18 * (0.000075 + 0.001868 * np.cos(year_angle) - 0.032077 * np.sin(year_angle)
+                                 - 0.014615 * np.cos(2 * year_angle) - 0.040849 * np.sin(2 * year_angle))   # minutes
+    hour_angle = np.radians((hour * 60 + equation_of_time + 4 * BRADLEY_LON) / 4 - 180)
+    latitude = np.radians(BRADLEY_LAT)
+    return (np.sin(latitude) * np.sin(declination)
+            + np.cos(latitude) * np.cos(declination) * np.cos(hour_angle))
+
+
+def clear_sky_ghi(sun):
+    """Sunlight on flat ground under a CLEAR sky, kW per m2 (Haurwitz model): 0 at night, about 1 at summer noon."""
+    sun = np.asarray(sun, dtype=float)
+    up = np.clip(sun, 1e-6, None)
+    return np.where(sun > 0, 1.098 * up * np.exp(-0.057 / up), 0.0)
+
+
+def sun_reaching_ground(clear_sky, cloud_cover_pct):
+    """Clear-sky sunlight dimmed by the cloud cover: roughly what rooftop solar panels get."""
+    return np.asarray(clear_sky, dtype=float) * (1 - np.asarray(cloud_cover_pct, dtype=float) / 100)
 
 
 def calendar_features(hours_utc):
-    """Hour of day, day of week and time of year as sines and cosines, plus weekend and holiday flags, in Connecticut time."""
+    """Hour of day, day of week and time of year as sines and cosines, plus weekend and holiday flags, in Connecticut
+    time. Also (Part 10.10) the sun: its height, clear-sky sunlight, and the semi-holiday flag. Extra columns are
+    harmless: a model only reads the columns its card lists."""
     local = pd.DatetimeIndex(hours_utc).tz_convert("America/New_York")
     out = pd.DataFrame(index=pd.DatetimeIndex(hours_utc))
     out["hour_sin"] = np.sin(2 * np.pi * local.hour / 24)
@@ -87,6 +135,10 @@ def calendar_features(hours_utc):
     out["doy_cos"] = np.cos(2 * np.pi * local.dayofyear / 365.25)
     out["is_weekend"] = (local.dayofweek >= 5).astype(float)
     out["is_holiday"] = local.tz_localize(None).normalize().isin(HOLIDAYS).astype(float)
+    sun = sun_height(hours_utc)
+    out["sun_elev_sin"] = sun
+    out["clearsky_ghi"] = clear_sky_ghi(sun)
+    out["is_semi_holiday"] = local.tz_localize(None).normalize().isin(SEMI_HOLIDAYS).astype(float)
     return out
 
 
@@ -106,16 +158,17 @@ def make_inputs(issue_hour_utc, load, weather, card):
     scaled_weather = []
     for column in WEATHER:
         scaled_weather.append((future_weather[column].values - card["weather_mean"][column]) / card["weather_std"][column])
-    future = np.column_stack(scaled_weather + [calendar_features(future_hours).values])
+    future = np.column_stack(scaled_weather + [calendar_features(future_hours)[CALENDAR].values])
     return past.astype("float32"), future.astype("float32")
 
 
 def make_window(issue_hour_utc, load, weather, card):
     """The model's ONE input for ONE forecast issued at issue_hour_utc (FP1's Sequential LSTM): a table with one row
     per hour and the columns in card["columns"].
-    Rows 1-168: the past week. The load is known (load_known = 1); the weather columns are 0.
-    Rows 169-192: the next 24 hours. The weather forecast and the calendar are filled in; the load is hidden
-    (load_known = 0, load_mw = 0), because that is what the model predicts."""
+    Rows 1-168: the past week. The load is known (load_known = 1); the weather columns and sun_ground are 0.
+    Rows 169-192: the next 24 hours. The weather forecast, the calendar and sun_ground (clear-sky sunlight x the
+    forecast cloud cover) are filled in; the load is hidden (load_known = 0, load_mw = 0), because that is what the
+    model predicts."""
     issue = pd.Timestamp(issue_hour_utc)
     past_hours = pd.date_range(issue - pd.Timedelta(hours=card["lookback_hours"]), periods=card["lookback_hours"], freq="h")
     future_hours = pd.date_range(issue + pd.Timedelta(hours=1), periods=card["horizon_hours"], freq="h")
@@ -123,17 +176,21 @@ def make_window(issue_hour_utc, load, weather, card):
     past = calendar_features(past_hours)
     for column in WEATHER:
         past[column] = 0.0
+    past["sun_ground"] = 0.0
     past["load_known"] = 1.0
     past["load_mw"] = (load.reindex(past_hours).values - card["load_mean"]) / card["load_std"]
 
     future = calendar_features(future_hours)
     for column in WEATHER:
         future[column] = (weather[column].reindex(future_hours).values - card["weather_mean"][column]) / card["weather_std"][column]
+    future["sun_ground"] = sun_reaching_ground(future["clearsky_ghi"].values,
+                                               weather["cloud_cover_pct"].reindex(future_hours).values)
     future["load_known"] = 0.0
     future["load_mw"] = 0.0
 
     window = pd.concat([past, future])
     return window[card["columns"]].values.astype("float32")
+# <<< end of the block shared with the notebook <<<
 # ----------------------------------------------------------------------------------------------------------------
 
 
